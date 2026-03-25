@@ -1,0 +1,820 @@
+---
+title: "Projekt 3"
+author: "Jakub Morawski, Paweł Modzelewski"
+date: "2026-01-23"
+output: 
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: true
+      smooth_scroll: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(gridExtra)
+library(e1071)  
+library(tseries)
+library(forecast)
+library(rugarch)
+library(patchwork)
+library(kableExtra)
+```
+
+## Załadowanie i przefiltrowanie danych
+
+```{r cars}
+dataH <- read.csv("spolkaH.csv", dec=".", sep=";")
+
+dataH$date_obj <- as.Date(as.character(dataH$daty), format = "%Y%m%d")
+
+#spróbujemy tidyverse:
+
+dataH <- dataH |>
+  mutate(
+    godz6 = sprintf("%06d", godz),
+    #dwukropki
+    czas = paste0(
+      substr(godz6, 1, 2), ":",
+      substr(godz6, 3, 4), ":",
+      substr(godz6, 5, 6)
+    ),
+    znacznik = ymd_hms(paste(daty, czas))
+  ) |>
+  select(znacznik, cena, vol)
+
+dataH <- dataH |>
+  filter(
+    #daty
+    as_date(znacznik) >= as.Date("2019-01-01") &
+    as_date(znacznik) <= as.Date("2019-06-30"),
+    
+    #godziny
+    znacznik >= floor_date(znacznik, "day") + hours(9) &
+    znacznik <= floor_date(znacznik, "day") + hours(17) + minutes(5)
+  )
+
+dataH_sekunda <- dataH %>%
+  mutate(
+    znacznik_sekunda = round_date(znacznik, "second"),
+    wartosc = cena*vol
+  ) %>%
+  group_by(znacznik_sekunda) %>%
+  summarise(
+    cena = sum(cena*vol, na.rm=T) / sum(vol, na.rm=T),
+    vol = sum(vol, na.rm=T),
+    wartosc = sum(wartosc, na.rm=T),
+    ile_tickow = n(),
+    .groups = "drop"
+  ) %>%
+  rename(znacznik = znacznik_sekunda) %>%
+  filter(!is.na(cena), cena>0)
+
+dataH_sekunda <- dataH_sekunda %>%
+  mutate(data = as.Date(znacznik)) %>%
+  group_by(data) %>%
+  mutate(log_stopa_zwrotu = log(cena / lag(cena))) %>%
+  ungroup()
+
+stopy_zwrotuH <- dataH_sekunda %>%
+  pull(log_stopa_zwrotu) %>%
+  na.omit()
+
+przetworz_5min <- function(data_sekunda) {
+  
+  #agregacja do 5-minutowych interwalow
+  data_5min <- data_sekunda %>%
+    mutate(
+      interval_5min = floor_date(znacznik, "5 minutes")
+    ) %>%
+    group_by(interval_5min) %>%
+    summarise(
+      close_price = last(cena),
+      volume = sum(vol, na.rm = TRUE),
+      trans_count = sum(ile_tickow, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(data_sesji = as.Date(interval_5min))
+  
+  #dla kazdego dnia znajduje ostatnia cene przed 17:00
+  data_final <- data_5min %>%
+    group_by(data_sesji) %>%
+    arrange(interval_5min) %>%
+    mutate(
+      #czy dany interwał jest poza godzinami ciaglymi
+      is_overtime = interval_5min >= ymd_hms(paste(data_sesji, "17:00:00")),
+      
+      #ostatnia cena z sesji ciaglej (przed 17:00)
+      last_cont_price = close_price[!is_overtime][length(close_price[!is_overtime])],
+      
+      #lag: dla dogrywki użyj last_cont_price, inaczej standardowy lag
+      lag_price = ifelse(is_overtime, last_cont_price, lag(close_price))
+    ) %>%
+    ungroup() %>%
+    mutate(
+      log_ret = log(close_price / lag_price),
+      log_vol = log(volume)
+    ) %>%
+    filter(!is.na(log_ret), is.finite(log_vol)) %>%
+    mutate(pora_dnia = format(interval_5min, "%H:%M")) %>%
+    select(-is_overtime, -last_cont_price, -lag_price)
+  
+  return(data_final)
+}
+
+dataH_5min <- przetworz_5min(dataH_sekunda)
+
+head(dataH_5min) %>% kbl(caption="5-minutowe stopy zwrotu") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+---------------------------------------------------------------
+
+### Stopy zwrotu overnight
+
+```{r}
+overnight <- dataH_sekunda %>%
+  group_by(data) %>%
+  summarise(
+    open_price = first(cena),
+    close_price = last(cena)
+  ) %>%
+  mutate(
+    overnight_ret = log(open_price / lag(close_price))
+  )
+overnight[is.na(overnight)] <- 0
+
+head(overnight) %>% kbl(caption="Stopy zwrotu overnight") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+---------------------------------------------------------------
+
+### Dzienne stopy zwrotu 
+
+```{r}
+daily_ret <- dataH_sekunda %>%
+  group_by(data) %>%
+  summarise(
+    close_price = last(cena),
+    open_price = first(cena)
+  ) %>%
+  mutate(
+    log_ret = log(close_price / open_price)
+  )
+
+daily_ret[is.na(daily_ret)] <- 0
+
+head(daily_ret) %>% kbl(caption="Dzienne stopy zwrotu") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+---------------------------------------------------------------
+
+## Obliczanie zmienności zrealizowanej
+
+### Sigma 1
+
+```{r}
+sig1 <- dataH_5min %>%
+  group_by(data_sesji) %>%
+  summarise(RV_intraday = sum(log_ret^2, na.rm = TRUE)) %>%
+  left_join(overnight, by = c("data_sesji" = "data")) %>%
+  mutate(
+    value = RV_intraday + coalesce(overnight_ret^2, 0)
+  ) %>%
+  select(data_sesji, value)
+
+head(sig1) %>% kbl(caption="Sigma1^2") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+### Sigma 2
+
+```{r}
+sig2 <- dataH_5min %>%
+  group_by(data_sesji) %>%
+  summarise(value = sum(log_ret ^ 2))
+
+head(sig2) %>% kbl(caption="Sigma2^2") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+### Sigma 3
+
+```{r}
+c <- var(overnight$overnight_ret, na.rm = TRUE)/var(daily_ret$log_ret, na.rm = TRUE)
+sig3 <- sig2 %>%
+  mutate(value = value * (1+c))
+
+head(sig3) %>% kbl(caption="Sigma3^2") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+---------------------------------------------------------------
+
+## Porównanie oszacowań dziennej zmienności
+
+```{r}
+sig_plot <- data.frame(
+  data = sig2$data_sesji,
+  sig1 = sqrt(sig1$value),
+  sig2 = sqrt(sig2$value),
+  sig3 = sqrt(sig3$value),
+  daily_ret=daily_ret$log_ret
+)
+
+sig_plot_long <- sig_plot %>%
+  pivot_longer(cols = -data, names_to = "miara", values_to = "wartosc")
+
+ggplot(sig_plot_long, aes(x = data, y = wartosc, color = miara)) +
+  geom_line(linewidth = 0.8) +
+  scale_color_manual(values = c(
+    "sig1" = "blue", 
+    "sig2" = "darkgreen", 
+    "sig3" = "red", 
+    "daily_ret" = "gray"
+  ),
+  labels = c(
+      "sig1" = "Sigma 1",
+      "sig2" = "Sigma 2",
+      "sig3" = "Sigma 3",
+      "daily_ret" = "Dzienna stopa zwrotu"
+    )
+  ) +
+  labs(
+    title = "Porównanie miar zmienności i dziennych stóp zwrotu",
+    x = "Data",
+    y = "Wartość",
+    color = "Legenda"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+***Analiza:***
+
+* Wszystkie trzy miary wykazują zbliżony przebieg, co potwierdza, że głównym czynnikiem kształtującym dzienną zmienność jest aktywność handlowa w trakcie sesji giełdowej
+
+* $\sigma_2$ systematycznie przyjmuje wartości najniższe, ponieważ ignoruje zwrot nocny, co de facto jest zaniżaniem rzeczywistej wartości.
+
+* $\sigma_3$ znajduje się nieco ponad $\sigma_2$, ponieważ koryguje $\sigma_2$ o stałą c, mając na celu uwzględnienie zmienności z okresu zamykania giełdy, ale nie wprowadzając szumu z luki otwarcia.
+
+* $\sigma_1$ przez większość czasu pokrywa się z pozostałymi miarami, ale widoczne na wykresie dwie zauważalne wartości odbiegające od pozostałych, wynikają z włączenia do obliczęń stopy zwrotu overnight.
+
+* Taki skok $\sigma_1$ przy relatywnie stabilnych $\sigma_2$ i $\sigma_3$ świadczy o wystąpieniu w tym dniu bardzo dużej luki cenowej na otwarcie sesji, która zanieczyściła estymator szumem losowym.
+
+* Widać wyraźną korelację między dzienną stopą zwrotu i wartościami miar zmienności zeralizowanej. W dniach w których dzienna stopa zwrotu przyjmuje wartości dalekie od zera, sigmy notują wzrosty.
+
+***Wnioski:***
+
+* Estymator $\sigma_1$ jest niestabilny i zawyża wyniki, nie odzwierciedlając faktycznej dynamiki handlu.
+
+* Estymator $\sigma_2$ wydaje się najbardziej wiarygodną miarą modelowania procesu cenowego, bo zachowuje stabuilność na przestrzeni sesji, a jednocześnie niweluje niedoszacowanie zmienności dziennej.
+
+* Wysoka zmienność prawdopodobnie pokrywa się z dniami o zwiększonym napływie informacji, co zostanie później sprawdzone w kwestii występowania składowej skokowego procesu cen.
+
+---------------------------------------------------------------
+
+## Testy na występowanie skoków
+
+### Zrealizowana dwupotęgowa wariacja
+
+```{r}
+bipower_var <- dataH_5min %>%
+  group_by(data_sesji) %>%
+  summarise(
+    n = n(),
+    bv_sum = sum(abs(log_ret) * abs(lag(log_ret)), na.rm = TRUE),
+    value = (pi / 2) * (n / (n - 1)) * bv_sum
+  ) %>%
+  select(data_sesji, value)
+
+head(bipower_var) %>% kbl(caption="Zrealizowana dwupotęgowa wariacja") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+---------------------------------------------------------------
+
+#### Porównanie ze zmiennością zrealizowaną
+
+```{r}
+var_plot <- data.frame(
+  data = sig2$data_sesji,
+  sig2 = sig2$value,
+  bipower_var=bipower_var$value
+)
+
+var_plot_long <- var_plot %>%
+  pivot_longer(cols = -data, names_to = "miara", values_to = "wartosc")
+
+ggplot(var_plot_long, aes(x = data, y = wartosc, color = miara)) +
+  geom_line(linewidth = 0.8) +
+  scale_color_manual(values = c(
+    "bipower_var" = "steelblue", 
+    "sig2" = "red"
+  ),
+  labels = c(
+      "sig2" = "Sigma 2",
+      "bipower_var" = "BV"
+    )
+  ) +
+  labs(
+    title = "Porównanie miary zmienności i dwupotęgowej wariacji",
+    x = "Data",
+    y = "Zmienność",
+    color = "Legenda"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+***Analiza:***
+
+* Na wykresie wyraźnie widać, że linia czerwona $\sigma_2^2$ prawie cały czas przebiega ponad niebieską dwupotęgowej wariacji.
+
+* Odstęp między liniami reprezentuje skokową składową procesu cen. Duże różnice, czyli piki $\sigma_2^2$, które nie mają odzwierciedlenia w aż tak dużym wzroście linii niebieskiej sugerują dni, w ciągu ktorych na rynku wystąpiły gwałtowne zmiany cen.
+
+* Niebieska linia jest gładsza w porównaniu do czerwonej, bo wariacja dwupotęgowa bazuje na modułach iloczynów sąsiadujących ze sobą stóp zwrotu, co neutralizuje wpływ pojedynczych, bardzo dużych zmian cen.
+
+***Wnioski:***
+
+* Istnienie znaczących różnic między obiema miarami potwierdza, że proces cenowy spółki H nie jest procesem czysto ciągłym. Skoki te są najprawdopodobniej reakcją rynku na napływ rzadkich i bardzo istotnych informacji
+
+* W celu szacowania "normalnej" zmienności wynikającej z płynnego handlu, wariancja dwupotęgowa jest bardziej precyzyjnym estymatorem.
+
+---------------------------------------------------------------
+
+#### Obliczenie estymatorów zintegrowanej kwartyczności
+
+Jako estymator wykorzystana zostanie wariacja ***trójpotęgowa*** oraz dodatkowo ***czteropotęgowa***. Dla wszystkich testów poziom istotności to $\alpha= 0.05$.
+
+```{r}
+mu_4_3 <- 2^(2/3) * gamma(7/6) / sqrt(pi)
+
+TQ_3 <- dataH_5min %>%
+  group_by(data_sesji) %>%
+  summarise(
+    n = n(),
+    tq_sum = sum(
+      abs(log_ret)^(4/3) * abs(lag(log_ret, 1))^(4/3) * abs(lag(log_ret, 2))^(4/3), 
+      na.rm = TRUE
+    ),
+    value = n * (mu_4_3^(-3)) * (n / (n - 2)) * tq_sum
+  ) %>%
+  select(data_sesji, value)
+
+mu_1 <- sqrt(2 / pi)
+
+RQ_4 <- dataH_5min %>%
+  group_by(data_sesji) %>%
+  summarise(
+    n = n(),
+    rq_sum = sum(
+      abs(log_ret)^(1) * abs(lag(log_ret, 1))^(1) * abs(lag(log_ret, 2))^(1) * abs(lag(log_ret, 3))^(1), 
+      na.rm = TRUE
+    ),
+    # Stała mu_1 dla rozkładu normalnego to sqrt(2/pi)
+    value = n * (mu_1^(-4)) * (n / (n - 3)) * rq_sum
+  ) %>%
+  select(data_sesji, value)
+
+head(TQ_3) %>% kbl(caption="Zrealizowana wariacja trójpotęgowa") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+
+head(RQ_4) %>% kbl(caption="Zrealizowana wariacja czteropotęgowa") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+---------------------------------------------------------------
+
+### Wykres miary względnego skoku
+
+```{r}
+rj_plot <- data.frame(
+  data = sig2$data_sesji,
+  rj = (sig2$value-bipower_var$value)/sig2$value
+)
+
+ggplot(rj_plot, aes(x = data, y = rj)) +
+  geom_line(color = "red", linewidth = 1) +
+  labs(
+    title = "Miara względnego skoku",
+    x = "Data",
+    y = "Wartość"
+  ) +
+  theme_minimal()
+```
+
+***Analiza:***
+
+* Wykres pozwala precyzyjnie określić, jaka część całkowitej zmienności procesu cen wynika z nagłych skoków
+
+* Wartości na osi pionowej wskazują udział procentowy skokowej części procesu w całkowitej zmienności dziennej. Na wykresie widać dni, w których skoki odpowiadały za ponad 50-60% całkowitej zmienności, to piki w okolicy marca i maja i w końcówce czerwca.
+
+* Miara charakteryzuje się dużą fluktuacją, co sugeruje, że mechanizm generujący ceny jest niejednorodny. Występuje dominacja procesów ciągłych, która jest często przerywana przez gwałtowne impulsy związane z informacją z rynku. Zatem trzy wspomniane piki to momenty w których rzadkie i niespodziewane zdarzenia przyniosły "niespodziankę" inwestorom.
+
+---------------------------------------------------------------
+
+### Test oparty na różnicach
+
+#### Obliczenie statystyki testowej dla wariacji trójpotęgowej jako estymator zintegrowanej kwartyczności
+
+```{r}
+theta <- (pi^2/4)+pi-5
+BNSr <- (sqrt(length(sig2)) * (sig2$value-bipower_var$value))/sqrt(theta*TQ_3$value)
+jumpDif <- BNSr > qnorm(0.95)
+cat("Liczba skoków wykryta:", sum(jumpDif), "\n")
+```
+
+Wykres:
+
+```{r}
+jump_long_dif <- var_plot_long %>%
+  left_join(data.frame(data = var_plot$data, jump = jumpDif), by = "data") %>%
+  filter(jump == TRUE)
+
+# 2. Wykres
+ggplot(var_plot_long, aes(x = data, y = wartosc, color = miara)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(
+    data = jump_long_dif, 
+    aes(fill = "Wykryty skok"),
+    color = "black",
+    shape = 21,
+    size = 3, 
+    stroke = 1
+  ) +
+  scale_color_manual(
+    values = c(
+      "bipower_var" = "steelblue", 
+      "sig2" = "red"
+    ),
+    labels = c(
+      "sig2" = "RV (Zmienność zrealizowana)",
+      "bipower_var" = "BV (Bipower Variation)"
+    )
+  ) +
+  scale_fill_manual(
+    name = NULL,
+    values = c("Wykryty skok" = "orange")
+  ) +
+  labs(
+    title = "Detekcja skoków testem opartym na różnicach dla wariacji trójpotęgowej",
+    subtitle = "Punkty oznaczają statystycznie istotne skoki obliczone",
+    x = "Data",
+    y = "Wariacja",
+    color = "Legenda"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+***Analiza:***
+
+* Na wykresie widać, że test wykrył dwa dni ze skokami (oznaczone żółtymi punktami) na przełomie kwietnia i maja. W tych konkretnych dniach statystyka testowa przekroczyła wartość krytyczną dla rozkładu normalnego przy poziomie istotności $\alpha=0,05$
+
+* Zauważyć można wysoki pik $RV$ niedaleko na prawo - koniec maja/początek czerwca, który jednak nie został wykryty jako statystycznie istotny skok. Może to wynikać z równoległego wzrostu $BV$, co test interpretuje jako wysoką zmienność ciągłego procesu, a nie jako skok lub roli mianownika statystyki testowej. Posiada ona w mianowniku estymator zintegrowanej kwartyczności, tutaj wariację trójpotęgową. Jeśli w dniu piku zmienność była ekstremalnie wysoka, mianownik statystyki również staje się bardzo duży, co "wygasza" wartość statystyki testowej i uniemożliwia odrzucenie hipotezy zerowej o braku skoków.
+
+***Wnioski:***
+
+* Wyniki potwierdzają, że test oparty na różnicach liniowych może czasami przeszacowywać lub błędnie identyfikować liczbę skoków w zależności od zachowania estymatora kwartyczności.
+
+* Wykryte skoki na przełomie kwietnia i maja sugerują wpływ specyficznych informacji giełdowych, które zmieniły cenę gwałtownie. Mogły to być takie zdarzenia jak publikacja wyników finansowych spółki, czy jakiś ważny komunikat publiczny.
+
+---------------------------------------------------------------
+
+#### Obliczenie statystyki testowej dla wariacji czteropotęgowej jako estymator zintegrowanej kwartyczności
+
+```{r}
+theta <- (pi^2/4)+pi-5
+BNSr <- (sqrt(length(sig2)) * (sig2$value-bipower_var$value))/sqrt(theta*RQ_4$value)
+jumpDif <- BNSr > qnorm(0.95)
+cat("Liczba skoków wykryta:", sum(jumpDif), "\n")
+```
+
+Wykres:
+
+```{r}
+jump_long_dif <- var_plot_long %>%
+  left_join(data.frame(data = var_plot$data, jump = jumpDif), by = "data") %>%
+  filter(jump == TRUE)
+
+# 2. Wykres
+ggplot(var_plot_long, aes(x = data, y = wartosc, color = miara)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(
+    data = jump_long_dif, 
+    aes(fill = "Wykryty skok"),
+    color = "black",
+    shape = 21,
+    size = 3, 
+    stroke = 1
+  ) +
+  scale_color_manual(
+    values = c(
+      "bipower_var" = "steelblue", 
+      "sig2" = "red"
+    ),
+    labels = c(
+      "sig2" = "RV (Zmienność zrealizowana)",
+      "bipower_var" = "BV (Bipower Variation)"
+    )
+  ) +
+  scale_fill_manual(
+    name = NULL,
+    values = c("Wykryty skok" = "orange")
+  ) +
+  labs(
+    title = "Detekcja skoków testem opartym na różnicach dla wariacji czteropotęgowej",
+    subtitle = "Punkty oznaczają statystycznie istotne skoki obliczone",
+    x = "Data",
+    y = "Wariacja",
+    color = "Legenda"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+***Analiza:***
+
+* Zastosowanie QQ zamiast TQ pozwoliło na wykrycie większej liczby skoków (4 zamiast 2), w tym nowych punktów w okolicach lutego i czerwca. Wynika to z faktu, że estymatory czteropotęgowe są teoretycznie bardziej odporne na wpływ dużej liczby skoków w danych, co może zwiększać moc testu w pewnych warunkach.
+
+* Wspomniany wcześniej wysoki pik $RV$ niedaleko na prawo w około 3/4 wykresu znów nie został wykryty jako statystycznie istotny skok, podczas gdy mniejsze skoki zostały wykryte. To potwierdza wpływ mianownika statystyki testowej. Wariacja czteropotęgowa w dniu ekstremalnego piku również osiąga bardzo wysoką wartość, co "wybacza" duże różnice $RV-BV$, uznając je za szum wysokiej zmienności, a nie statystycznie istotną anomalię.
+
+***Wnioski:***
+
+* Wybór estymatora kwartyczności istotnie wpływa na wynik końcowy. Aby uzyskać najbardziej stabilny obraz, przeprowadzono także testy logarytmiczne, które są mniej wrażliwe na ekstremalne piki zmienności w mianowniku.
+
+---------------------------------------------------------------
+
+### Test oparty na różnicach logarytmów
+
+#### Obliczenie statystyki testowej dla wariacji trójpotęgowej jako estymator zintegrowanej kwartyczności
+
+```{r}
+BNSl <- (sqrt(length(sig2)) * (log(sig2$value)-log(bipower_var$value)))/sqrt(theta*TQ_3$value/bipower_var$value^2)
+jumpLog <- BNSl > qnorm(0.95)
+cat("Liczba skoków wykryta:", sum(sum(jumpLog)), "\n")
+```
+
+Wykres:
+
+```{r}
+skoki_long <- var_plot_long %>%
+  left_join(data.frame(data = var_plot$data, jump = jumpLog), by = "data") %>%
+  filter(jump == TRUE)
+
+# 2. Wykres
+ggplot(var_plot_long, aes(x = data, y = wartosc, color = miara)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(
+    data = skoki_long, 
+    aes(fill = "Wykryty skok"),
+    color = "black",
+    shape = 21,
+    size = 3, 
+    stroke = 1
+  ) +
+  scale_color_manual(
+    values = c(
+      "bipower_var" = "steelblue", 
+      "sig2" = "red"
+    ),
+    labels = c(
+      "sig2" = "RV (Zmienność zrealizowana)",
+      "bipower_var" = "BV (Bipower Variation)"
+    )
+  ) +
+  scale_fill_manual(
+    name = NULL,
+    values = c("Wykryty skok" = "orange")
+  ) +
+  labs(
+    title = "Detekcja skoków testem opartym na różnicach logarytmów dla wariacji trójpotęgowej",
+    subtitle = "Punkty oznaczają statystycznie istotne skoki",
+    x = "Data",
+    y = "Wariacja",
+    color = "Legenda"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+***Analiza:***
+
+* Transformacja logarytmiczna niejako ściąga ekstremalne wartości, co sprawia, że statystyka testowa jest mniej podatna na odrzucenie hipotezy zerowej o braku skoków przy nawet umiarkowanych odchyleniach.
+Czyni to ten test bardzo rygorystycznym.
+
+* Wspomniany wcześniej wysoki pik $RV$ niedaleko na prawo w około 3/4 wykresu znów nie został wykryty jako statystycznie istotny skok. Test logarytmiczny potwierdza diagnozę, że tamto zdarzenie było raczej wynikiem ekstremalnie wysokiej wariancji procesu ciągłego a nie pojedynczym skokiem który mógłby zaburzyć strukturę logarytmiczną szeregu.
+
+***Wnioski:***
+
+* Test oparty na różnicach logarytmów ma najlepsze własności w próbach o skończonej wielkości, a fakt, że wykrył on tylko jeden skok, który wykrywają wszystkie przeprowadzone dotychczas testy sugeruje, że tylko to konkretne zdarzenie na przełomie kwietnia i maja miało charakter „czystego” skoku cenowego, a pozostałe sygnały z innych testów mogły być błędami I rodzaju wynikającymi ze specyfiki liniowych statystyk.
+
+* Wykorzystanie wariacji trójpotęgowej jako estymatora zintegrowanej kwartyczności w połączeniu z logarytmami tworzy bardzo stabilne narzędzie diagnostyczne. Okazuje sie, że gwatowne ruchy cenowe spółki H mają podłoże w zmienności ciągłej, a nie w skokowych napływach informacji z rynku. Świadczy to o wysokiej płynności spółki. 
+
+---------------------------------------------------------------
+
+#### Obliczenie statystyki testowej dla wariacji czteropotęgowej jako estymator zintegrowanej kwartyczności
+
+```{r}
+BNSl <- (sqrt(length(sig2)) * (log(sig2$value)-log(bipower_var$value)))/sqrt(theta*RQ_4$value/bipower_var$value^2)
+jumpLog <- BNSl > qnorm(0.95)
+cat("Liczba skoków wykryta:", sum(sum(jumpLog)), "\n")
+```
+
+Wykres:
+
+```{r}
+skoki_long <- var_plot_long %>%
+  left_join(data.frame(data = var_plot$data, jump = jumpLog), by = "data") %>%
+  filter(jump == TRUE)
+
+# 2. Wykres
+ggplot(var_plot_long, aes(x = data, y = wartosc, color = miara)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(
+    data = skoki_long, 
+    aes(fill = "Wykryty skok"),
+    color = "black",
+    shape = 21,
+    size = 3, 
+    stroke = 1
+  ) +
+  scale_color_manual(
+    values = c(
+      "bipower_var" = "steelblue", 
+      "sig2" = "red"
+    ),
+    labels = c(
+      "sig2" = "RV (Zmienność zrealizowana)",
+      "bipower_var" = "BV (Bipower Variation)"
+    )
+  ) +
+  scale_fill_manual(
+    name = NULL,
+    values = c("Wykryty skok" = "orange")
+  ) +
+  labs(
+    title = "Detekcja skoków testem opartym na różnicach logarytmów dla wariacji czteropotęgowej",
+    subtitle = "Punkty oznaczają statystycznie istotne skoki",
+    x = "Data",
+    y = "Wariacja",
+    color = "Legenda"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+***Analiza:***
+
+* W porównaniu do poprzedniego testu logarytmicznego, który wykrył tylko jeden skok, zastosowanie wariacji czteropotęgowej pozwoliło zidentyfikować dwa dni ze statystycznie istotnymi skokami.
+
+* Jej zastosowanie w mianowniku statystyki testowej często skutkuje wyższą mocą testu niż w przypadku wariacji trójpotęgowej, co tłumaczy wykrycie dodatkowego skoku przy zachowaniu tego samego poziomu istotności $\alpha=0.05$
+
+***Wnioski:***
+
+* Test oparty na różnicach logarytmów ma najlepsze własności w próbach o skończonej wielkości. Jest on mniej skłonny do generowania "fałszywych alarmów" niż testy liniowe, które w poprzednich próbach wykrywały więcej skoków.
+
+* Ponownie niewykryty wcześniej wspomniany pik potwierdza, że tamto zdarzenie było raczej wynikiem ekstremalnie wysokiej wariancji procesu ciągłego.
+
+---------------------------------------------------------------
+
+### Test ilorazowy
+
+#### Obliczenie statystyki testowej dla wariacji trójpotęgowej jako estymator zintegrowanej kwartyczności
+
+```{r}
+BNSi <- (sqrt(length(sig2)) * (log(sig2$value)-log(bipower_var$value)))/sqrt(theta*pmax(1, TQ_3$value / (bipower_var$value^2)))
+jumpQ <- BNSi > qnorm(0.95)
+cat("Liczba skoków wykryta:", sum(sum(jumpQ)), "\n")
+```
+
+Wykres:
+
+```{r}
+skoki_long <- var_plot_long %>%
+  left_join(data.frame(data = var_plot$data, jump = jumpQ), by = "data") %>%
+  filter(jump == TRUE)
+
+# 2. Wykres
+ggplot(var_plot_long, aes(x = data, y = wartosc, color = miara)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(
+    data = skoki_long, 
+    aes(fill = "Wykryty skok"),
+    color = "black",
+    shape = 21,
+    size = 3, 
+    stroke = 1
+  ) +
+  scale_color_manual(
+    values = c(
+      "bipower_var" = "steelblue", 
+      "sig2" = "red"
+    ),
+    labels = c(
+      "sig2" = "RV (Zmienność zrealizowana)",
+      "bipower_var" = "BV (Bipower Variation)"
+    )
+  ) +
+  scale_fill_manual(
+    name = NULL,
+    values = c("Wykryty skok" = "orange")
+  ) +
+  labs(
+    title = "Detekcja skoków testem ilorazowym dla wariacji trójpotęgowej",
+    subtitle = "Punkty oznaczają statystycznie istotne skoki",
+    x = "Data",
+    y = "Wariacja",
+    color = "Legenda"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+***Analiza:***
+
+* Test ilorazowy wykrył dokładnie ten sam skok na przełomie kwietnia i maja, co test oparty o różnice logarytmów, przy tym samym IQ
+
+* Podobnie jak test logarytmiczny, test ilorazowy zignorował ekstremalny pik zmienności zrealizowanej ($RV$) w 3/4 badanego okresu oraz mniejsze odchylenia, które były uznawane za skoki przez testy liniowe.
+
+* Statystyka testu ilorazowego, wykorzystująca funkcję $max$ w mianowniku jest szczególnie rygorystyczna przy dużej zmienności, co sprawia, że wykrycie skoku w konkretnym dniu jest bardzo selektywne.
+
+***Wnioski:***
+
+* Fakt, że dwa zaawansowane testy wskazują tylko ten sam dzień, sugeruje, że tylko to konkretne zdarzenie na przełomie kwietnia i maja jest rzeczywistym skokiem cenowym. Inne piki zmienności są prawdopodobnie wynikiem bardzo intensywnego handlu ciągłego.
+
+* Porównanie wyników testów pokazuje, że testy ilorazowe i logarytmiczne są mniej podatne na błędy I rodzaju
+
+---------------------------------------------------------------
+
+#### Obliczenie statystyki testowej dla wariancji czteropotęgowej jako estymator zintegrowanej kwartyczności
+
+```{r}
+BNSi <- (sqrt(length(sig2)) * (log(sig2$value)-log(bipower_var$value)))/sqrt(theta*pmax(1, RQ_4$value / (bipower_var$value^2)))
+jumpQ <- BNSi > qnorm(0.95)
+cat("Liczba skoków wykryta:", sum(sum(jumpQ)), "\n")
+```
+
+Wykres:
+
+```{r}
+skoki_long <- var_plot_long %>%
+  left_join(data.frame(data = var_plot$data, jump = jumpQ), by = "data") %>%
+  filter(jump == TRUE)
+
+# 2. Wykres
+ggplot(var_plot_long, aes(x = data, y = wartosc, color = miara)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(
+    data = skoki_long, 
+    aes(fill = "Wykryty skok"),
+    color = "black",
+    shape = 21,
+    size = 3, 
+    stroke = 1
+  ) +
+  scale_color_manual(
+    values = c(
+      "bipower_var" = "steelblue", 
+      "sig2" = "red"
+    ),
+    labels = c(
+      "sig2" = "RV (Zmienność zrealizowana)",
+      "bipower_var" = "BV (Bipower Variation)"
+    )
+  ) +
+  scale_fill_manual(
+    name = NULL,
+    values = c("Wykryty skok" = "orange")
+  ) +
+  labs(
+    title = "Detekcja skoków testem ilorazowym dla wariacji czteropotęgowej",
+    subtitle = "Punkty oznaczają statystycznie istotne skoki",
+    x = "Data",
+    y = "Wariacja",
+    color = "Legenda"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+***Analiza:***
+
+* Test ilorazowy używający wariacji czteropotęgowej wykrył dokładnie ten sam skok na przełomie kwietnia i maja, co wersja używająca wariacji trójpotęgowej. Fakt, że zmiana estymatora kwartyczności na teoretycznie bardziej odporny $QQ$ nie zmieniła wyniku, świadczy o bardzo wysokiej istotności statystycznej tego konkretnego zdarzenia
+
+* Podobnie jak pozostałe testy, ten również zignorował ekstremalny pik zmienności zrealizowanej ($RV$) w 3/4 badanego okresu oraz mniejsze odchylenia, które były uznawane za skoki przez testy liniowe.
+
+* Statystyka testu ilorazowego, wykorzystująca funkcję $max$ w mianowniku jest szczególnie rygorystyczna przy dużej zmienności, co sprawia, że wykrycie skoku w konkretnym dniu jest bardzo selektywne.
+
+***Wnioski:***
+
+* Użycie wariancji czteropotęgowej ($QQ_t$) jako miary zintegrowanej kwartyczności ($IQ_t$) zazwyczaj koryguje obciążenia wynikające z dużej liczby skoków. Skoro wynik testu pozostał identyczny jak przy wariacji trójpotęgowej, da się wnioskować że struktura skoków spółki H jest na tyle przejrzysta, że oba estymatory dają spójny obraz rynku.
+
+* Konsekwentna detekcja tylko jednego dnia przez wszystkie zaawansowane testy (logarytmiczne i ilorazowe), a także testy liniowe, wskazuje na to, że był to jedyny dzień o charakterze "prawdziwego" skoku cenowego, prawdopodobnie wywołanego napływem nowej, punktowej informacji, co omówiono wcześniej. Pozostałe dni o podwyższonym $RV$, wykrywane jedynie przez testy liniowe, trzeba interpretować jako okresy wysokiej zmienności ciągłej (dyfuzji), a nie skokowe anomalie.
+
